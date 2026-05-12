@@ -1,11 +1,18 @@
+import Code from "./models/Code.js";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { Resend } from "resend";
+import mongoose from 'mongoose';
 
 dotenv.config();
 
 const app = express();
+
+// Простое подключение без лишних опций
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('✅ MongoDB подключена'))
+  .catch(err => console.error('❌ MongoDB ошибка:', err.message));
 
 app.use(cors());
 app.use(express.json());
@@ -15,6 +22,11 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 app.post("/send-code", async (req, res) => {
   try {
     const { email, code } = req.body;
+
+    await Code.creaыte({
+  email,
+  code
+});
 
     if (!email || !code) {
       return res.status(400).json({
@@ -69,13 +81,13 @@ app.post("/send-code", async (req, res) => {
 
   } catch (err) {
     console.error(err);
-
     res.status(500).json({
       error: "Email sending failed",
     });
   }
 });
 
-app.listen(3001, () => {
-  console.log("Server running on port 3001");
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
 });
