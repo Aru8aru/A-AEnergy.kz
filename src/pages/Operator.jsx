@@ -4,7 +4,7 @@ import { useNavigate } from "react-router-dom";
 // ─────────────────────────────────────────────────────────────────────────────
 // FIREBASE CONFIG — то же значение что в Admin.jsx
 // ─────────────────────────────────────────────────────────────────────────────
-const FB_URL = "https://a-a-energy-default-rtdb.firebaseio.com"
+const FB_URL = "https://YOUR_PROJECT-default-rtdb.firebaseio.com";
 
 // ─── CSS ─────────────────────────────────────────────────────────────────────
 const GLOBAL_CSS = `
@@ -348,34 +348,61 @@ async function fbPush(msg) {
   } catch { return false; }
 }
 
-// SSE-подписка — мгновенные обновления без polling
+// Firebase streaming через fetch+ReadableStream (правильный способ для Firebase REST)
+// EventSource не работает — Firebase требует заголовок Accept: text/event-stream
 function fbSubscribe(onData, onError) {
   if (!FB_ENABLED) return () => {};
-  let es;
-  try {
-    es = new EventSource(`${FB_URL}/qmg_chat.json?stream=true`);
-    es.addEventListener('put', (e) => {
-      try {
-        const parsed = JSON.parse(e.data);
-        const raw = parsed?.data;
-        if (!raw) { onData([]); return; }
-        const msgs = Object.values(raw)
-          .filter(Boolean)
-          .sort((a, b) => a.timestamp - b.timestamp);
-        onData(msgs);
-      } catch {}
-    });
-    es.addEventListener('patch', (e) => {
-      try {
-        const parsed = JSON.parse(e.data);
-        const raw = parsed?.data;
-        if (!raw) return;
-        onData(Object.values(raw).filter(Boolean));
-      } catch {}
-    });
-    es.onerror = () => { onError?.(); };
-  } catch (err) { onError?.(err); return () => {}; }
-  return () => { try { es?.close(); } catch {} };
+  let abortCtrl = new AbortController();
+  let retryTimer = null;
+
+  const connect = async () => {
+    try {
+      const res = await fetch(`${FB_URL}/qmg_chat.json?stream=true`, {
+        headers: { 'Accept': 'text/event-stream' },
+        signal: abortCtrl.signal,
+      });
+      if (!res.ok || !res.body) { onError?.(); return; }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done || abortCtrl.signal.aborted) break;
+        buf += decoder.decode(value, { stream: true });
+        const events = buf.split('
+
+');
+        buf = events.pop() ?? '';
+        for (const block of events) {
+          const lines = block.split('
+');
+          let eventType = 'put', dataLine = '';
+          for (const line of lines) {
+            if (line.startsWith('event:')) eventType = line.slice(6).trim();
+            if (line.startsWith('data:')) dataLine = line.slice(5).trim();
+          }
+          if (!dataLine) continue;
+          try {
+            const parsed = JSON.parse(dataLine);
+            const raw = parsed?.data;
+            if (eventType === 'put') {
+              if (!raw) { onData([]); continue; }
+              onData(Object.values(raw).filter(Boolean).sort((a,b)=>a.timestamp-b.timestamp));
+            } else if (eventType === 'patch' && raw) {
+              onData(Object.values(raw).filter(Boolean));
+            }
+          } catch {}
+        }
+      }
+    } catch (err) {
+      if (abortCtrl.signal.aborted) return;
+      onError?.();
+      retryTimer = setTimeout(connect, 3000);
+    }
+  };
+
+  connect();
+  return () => { abortCtrl.abort(); if (retryTimer) clearTimeout(retryTimer); };
 }
 
 function loadLocalMsgs() { try { return JSON.parse(localStorage.getItem('qmg_msgs_ns')||'[]'); } catch { return []; } }
