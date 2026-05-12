@@ -5,8 +5,7 @@ import { useNavigate } from "react-router-dom";
 // FIREBASE CONFIG — замените на свой проект с https://console.firebase.google.com
 // Создайте Realtime Database, правила: { "rules": { ".read": true, ".write": true } }
 // ─────────────────────────────────────────────────────────────────────────────
-const FB_URL = "https://YOUR_PROJECT-default-rtdb.firebaseio.com";
-// Если не хотите Firebase — будет работать только BroadcastChannel (один браузер)
+const FB_URL = "https://a-a-energy-default-rtdb.firebaseio.com"// Если не хотите Firebase — будет работать только BroadcastChannel (один браузер)
 
 // ─── CSS ─────────────────────────────────────────────────────────────────────
 const ADMIN_CSS = `

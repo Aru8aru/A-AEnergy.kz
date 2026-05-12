@@ -4,8 +4,7 @@ import { useNavigate } from "react-router-dom";
 // ─────────────────────────────────────────────────────────────────────────────
 // FIREBASE CONFIG — то же значение что в Admin.jsx
 // ─────────────────────────────────────────────────────────────────────────────
-const FB_URL = "https://YOUR_PROJECT-default-rtdb.firebaseio.com";
-
+const FB_URL = "https://a-a-energy-default-rtdb.firebaseio.com"
 // ─── CSS ─────────────────────────────────────────────────────────────────────
 const GLOBAL_CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Golos+Text:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
