@@ -4,7 +4,7 @@ import { useNavigate } from "react-router-dom";
 // ─────────────────────────────────────────────────────────────────────────────
 // FIREBASE CONFIG — то же значение что в Admin.jsx
 // ─────────────────────────────────────────────────────────────────────────────
-const FB_URL = "https://YOUR_PROJECT-default-rtdb.firebaseio.com";
+const FB_URL = "https://a-a-energy-default-rtdb.firebaseio.com"
 
 // ─── CSS ─────────────────────────────────────────────────────────────────────
 const GLOBAL_CSS = `
@@ -333,26 +333,49 @@ function generateNSTicket(from, to, Ks) {
   };
 }
 
-// ─── Firebase ─────────────────────────────────────────────────────────────────
+// ─── Firebase Realtime Helpers ────────────────────────────────────────────────
+const FB_ENABLED = FB_URL && !FB_URL.includes('YOUR_PROJECT');
+
 async function fbPush(msg) {
-  if(!FB_URL||FB_URL.includes('YOUR_PROJECT')) return false;
+  if (!FB_ENABLED) return false;
   try {
-    const res = await fetch(`${FB_URL}/qmg_chat/${msg.id}.json`,{
-      method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(msg)
+    const res = await fetch(`${FB_URL}/qmg_chat/${msg.id}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(msg),
     });
     return res.ok;
   } catch { return false; }
 }
 
-async function fbFetch(since=0) {
-  if(!FB_URL||FB_URL.includes('YOUR_PROJECT')) return [];
+// SSE-подписка — мгновенные обновления без polling
+function fbSubscribe(onData, onError) {
+  if (!FB_ENABLED) return () => {};
+  let es;
   try {
-    const res = await fetch(`${FB_URL}/qmg_chat.json`);
-    if(!res.ok) return [];
-    const data = await res.json();
-    if(!data) return [];
-    return Object.values(data).filter(m=>m&&m.timestamp>since).sort((a,b)=>a.timestamp-b.timestamp);
-  } catch { return []; }
+    es = new EventSource(`${FB_URL}/qmg_chat.json?stream=true`);
+    es.addEventListener('put', (e) => {
+      try {
+        const parsed = JSON.parse(e.data);
+        const raw = parsed?.data;
+        if (!raw) { onData([]); return; }
+        const msgs = Object.values(raw)
+          .filter(Boolean)
+          .sort((a, b) => a.timestamp - b.timestamp);
+        onData(msgs);
+      } catch {}
+    });
+    es.addEventListener('patch', (e) => {
+      try {
+        const parsed = JSON.parse(e.data);
+        const raw = parsed?.data;
+        if (!raw) return;
+        onData(Object.values(raw).filter(Boolean));
+      } catch {}
+    });
+    es.onerror = () => { onError?.(); };
+  } catch (err) { onError?.(err); return () => {}; }
+  return () => { try { es?.close(); } catch {} };
 }
 
 function loadLocalMsgs() { try { return JSON.parse(localStorage.getItem('qmg_msgs_ns')||'[]'); } catch { return []; } }
@@ -536,9 +559,10 @@ function ChatPage({ addLog, showToast }) {
   const [ttl, setTtl] = useState(SESSION_TTL);
   const [sessionKs, setSessionKs] = useState(()=>rHex(16));
   const [sessionStart, setSessionStart] = useState(Date.now());
-  const [lastFetch, setLastFetch] = useState(0);
+  const [connected, setConnected] = useState(false);
   const endRef = useRef(null);
   const bcRef = useRef(null);
+  const knownIds = useRef(new Set());
 
   const addCLog = useCallback((type,tag,msg)=>{
     const cls={ok:'bok',err:'berr',warn:'bwarn',info:'binfo'}[type]||'binfo';
@@ -553,6 +577,7 @@ function ChatPage({ addLog, showToast }) {
     showToast('🔑 KDC выдал новый сессионный ключ','twarn');
   },[addCLog,showToast]);
 
+  // TTL countdown
   useEffect(()=>{
     const t=setInterval(()=>{
       const elapsed=(Date.now()-sessionStart)/1000;
@@ -563,55 +588,70 @@ function ChatPage({ addLog, showToast }) {
     return ()=>clearInterval(t);
   },[sessionStart,renewSession]);
 
+  // ── Инициализация: локальный кеш + Firebase SSE ──────────────────────────
   useEffect(()=>{
+    // 1. Локальный кеш
     const local=loadLocalMsgs();
-    if(local.length) setMessages(local);
+    if(local.length){
+      setMessages(local);
+      local.forEach(m=>knownIds.current.add(m.id));
+    }
     addCLog('ok','[KDC]',`Сессионный ключ: ${sessionKs.substr(0,8)}… TTL=${SESSION_TTL}s`);
-    addCLog('info','[NS]','NS-KDC протокол активен');
-  },[]);
 
-  // BroadcastChannel — same browser
-  useEffect(()=>{
+    // 2. BroadcastChannel — тот же браузер, разные вкладки
     try {
       bcRef.current=new BroadcastChannel('qmg_chat_ns');
       bcRef.current.onmessage=(e)=>{
-        if(e.data?.type==='new_msg'&&e.data.msg.from!=='operator'){
+        if(e.data?.type==='new_msg'){
+          const m=e.data.msg;
+          if(m.from==='operator') return;
+          if(knownIds.current.has(m.id)) return;
+          knownIds.current.add(m.id);
           setMessages(prev=>{
-            if(prev.find(m=>m.id===e.data.msg.id)) return prev;
-            const updated=[...prev,e.data.msg];
+            const updated=[...prev,m].sort((a,b)=>a.timestamp-b.timestamp);
             saveLocalMsgs(updated); return updated;
           });
-          addCLog('ok','[ЧАТ]','admin → operator: зашифрованное сообщение получено');
-          showToast('💬 Новое зашифрованное сообщение от администратора!','tok');
+          addCLog('ok','[ЧАТ]','admin → operator: сообщение получено (та же вкладка)');
+          showToast('💬 Новое сообщение от администратора!','tok');
         }
       };
     } catch {}
-    return ()=>{ try{bcRef.current?.close();}catch{} };
-  },[addCLog,showToast]);
 
-  // Firebase polling — cross-device
-  useEffect(()=>{
-    const poll=async()=>{
-      const remote=await fbFetch(lastFetch);
-      if(remote.length){
-        setLastFetch(Date.now());
-        setMessages(prev=>{
-          const ids=new Set(prev.map(m=>m.id));
-          const newMsgs=remote.filter(m=>!ids.has(m.id)&&m.from!=='operator');
-          if(!newMsgs.length) return prev;
-          const updated=[...prev,...newMsgs].sort((a,b)=>a.timestamp-b.timestamp);
-          saveLocalMsgs(updated);
-          newMsgs.forEach(()=>{
-            addCLog('ok','[FIREBASE]','Новое сообщение от admin (cross-device)');
-            showToast('📡 Новое сообщение от администратора!','tok');
+    // 3. Firebase SSE — разные устройства, мгновенно
+    if(FB_ENABLED){
+      addCLog('info','[FIREBASE]','Подключение к Firebase Realtime DB…');
+      const unsub=fbSubscribe(
+        (allMsgs)=>{
+          setConnected(true);
+          const incoming=allMsgs.filter(m=>{
+            if(m.from==='operator') return false;
+            if(knownIds.current.has(m.id)) return false;
+            return true;
           });
-          return updated;
-        });
-      }
-    };
-    const t=setInterval(poll,3000);
-    return ()=>clearInterval(t);
-  },[lastFetch,addCLog,showToast]);
+          if(!incoming.length) return;
+          incoming.forEach(m=>knownIds.current.add(m.id));
+          setMessages(prev=>{
+            const ids=new Set(prev.map(x=>x.id));
+            const fresh=incoming.filter(m=>!ids.has(m.id));
+            if(!fresh.length) return prev;
+            const updated=[...prev,...fresh].sort((a,b)=>a.timestamp-b.timestamp);
+            saveLocalMsgs(updated);
+            fresh.forEach(()=>{
+              addCLog('ok','[FIREBASE]','admin → operator: сообщение получено мгновенно');
+              showToast('💬 Новое сообщение от администратора!','tok');
+            });
+            return updated;
+          });
+        },
+        ()=>{ setConnected(false); addCLog('warn','[FIREBASE]','Соединение потеряно…'); }
+      );
+      return ()=>{ unsub(); try{bcRef.current?.close();}catch{}; };
+    }
+
+    addCLog('info','[NS]','NS-KDC протокол активен (BroadcastChannel режим)');
+    return ()=>{ try{bcRef.current?.close();}catch{}; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
 
   useEffect(()=>{ endRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
 
@@ -629,16 +669,25 @@ function ChatPage({ addLog, showToast }) {
       from:'operator', cipher, ticket,
       timestamp:Date.now(), time:ts(),
     };
-    const updated=[...messages,msg];
-    setMessages(updated); saveLocalMsgs(updated); setInput('');
+    // Показываем сразу локально
+    knownIds.current.add(msg.id);
+    setMessages(prev=>{
+      const updated=[...prev,msg];
+      saveLocalMsgs(updated); return updated;
+    });
+    setInput('');
     try{ bcRef.current?.postMessage({type:'new_msg',msg}); }catch{}
-    fbPush(msg).then(ok=>{ if(ok) addCLog('ok','[FIREBASE]','Опубликовано в Firebase'); });
+    fbPush(msg).then(ok=>{
+      if(ok) addCLog('ok','[FIREBASE]','Сообщение отправлено — admin получит мгновенно');
+      else addCLog('warn','[FIREBASE]','Firebase недоступен — только BroadcastChannel');
+    });
     addCLog('ok','[NS-KDC]',`operator→admin: Ks=${ks.substr(0,8)}… Na=0x${ticket.Na}`);
   };
 
   const ttlPct=(ttl/SESSION_TTL)*100;
   const ttlColor=ttl>60?'var(--green)':ttl>20?'var(--amber)':'var(--red)';
   const ttlCls=ttl>60?'ns-ttl-ok':ttl>20?'ns-ttl-warn':'ns-ttl-dead';
+  const connLabel=!FB_ENABLED?'BroadcastChannel':connected?'🟢 Firebase RT':'🟡 Переподключение…';
 
   return (
     <div className="pg">
@@ -659,7 +708,10 @@ function ChatPage({ addLog, showToast }) {
       <div className="card mb">
         <div className="card-t">
           <span>🔑 KDC Сессионный ключ</span>
-          <span className={`bdg ${ttlCls}`}>TTL: {ttl}s</span>
+          <span style={{display:'flex',gap:8,alignItems:'center'}}>
+            <span style={{fontSize:10,color:'var(--t2)'}}>{connLabel}</span>
+            <span className={`bdg ${ttlCls}`}>TTL: {ttl}s</span>
+          </span>
         </div>
         <div style={{display:'flex',alignItems:'center',gap:10}}>
           <div style={{flex:1,height:4,background:'var(--border)',borderRadius:2,overflow:'hidden'}}>

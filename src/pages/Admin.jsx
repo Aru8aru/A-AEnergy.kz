@@ -5,7 +5,7 @@ import { useNavigate } from "react-router-dom";
 // FIREBASE CONFIG — замените на свой проект с https://console.firebase.google.com
 // Создайте Realtime Database, правила: { "rules": { ".read": true, ".write": true } }
 // ─────────────────────────────────────────────────────────────────────────────
-const FB_URL = "https://YOUR_PROJECT-default-rtdb.firebaseio.com";
+const FB_URL = "https://a-a-energy-default-rtdb.firebaseio.com"
 // Если не хотите Firebase — будет работать только BroadcastChannel (один браузер)
 
 // ─── CSS ─────────────────────────────────────────────────────────────────────
@@ -388,29 +388,55 @@ function generateNSTicket(from, to, Ks) {
   };
 }
 
-// ─── Firebase Helpers ─────────────────────────────────────────────────────────
-const FB_MSGS_PATH = `${FB_URL}/qmg_chat.json`;
+// ─── Firebase Realtime Helpers ────────────────────────────────────────────────
+// Использует Firebase REST + Server-Sent Events (?stream=true) для мгновенной доставки
+// без polling. Сообщения приходят через WebSocket-like SSE соединение.
 
+const FB_ENABLED = FB_URL && !FB_URL.includes('YOUR_PROJECT');
+
+// Записать сообщение в Firebase
 async function fbPush(msg) {
-  if (!FB_URL || FB_URL.includes('YOUR_PROJECT')) return false;
+  if (!FB_ENABLED) return false;
   try {
     const res = await fetch(`${FB_URL}/qmg_chat/${msg.id}.json`, {
-      method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(msg)
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(msg),
     });
     return res.ok;
   } catch { return false; }
 }
 
-async function fbFetch(since=0) {
-  if (!FB_URL || FB_URL.includes('YOUR_PROJECT')) return [];
+// Подписаться на Firebase через SSE (?stream=true) — мгновенные обновления без polling
+// onData(msgs[]) вызывается при каждом изменении в базе
+function fbSubscribe(onData, onError) {
+  if (!FB_ENABLED) return () => {};
+  let es;
   try {
-    const res = await fetch(`${FB_URL}/qmg_chat.json`);
-    if (!res.ok) return [];
-    const data = await res.json();
-    if (!data) return [];
-    return Object.values(data).filter(m => m && m.timestamp > since).sort((a,b)=>a.timestamp-b.timestamp);
-  } catch { return []; }
+    es = new EventSource(`${FB_URL}/qmg_chat.json?stream=true`);
+    es.addEventListener('put', (e) => {
+      try {
+        const parsed = JSON.parse(e.data);
+        const raw = parsed?.data;
+        if (!raw) { onData([]); return; }
+        const msgs = Object.values(raw)
+          .filter(Boolean)
+          .sort((a, b) => a.timestamp - b.timestamp);
+        onData(msgs);
+      } catch {}
+    });
+    es.addEventListener('patch', (e) => {
+      try {
+        const parsed = JSON.parse(e.data);
+        const raw = parsed?.data;
+        if (!raw) return;
+        const newMsgs = Object.values(raw).filter(Boolean);
+        onData(newMsgs); // только новые/изменённые
+      } catch {}
+    });
+    es.onerror = () => { onError?.(); };
+  } catch (err) { onError?.(err); return () => {}; }
+  return () => { try { es?.close(); } catch {} };
 }
 
 // ─── Local fallback storage ────────────────────────────────────────────────────
@@ -653,9 +679,11 @@ function ChatPage({ addLog, showToast }) {
   const [ttl, setTtl] = useState(SESSION_TTL);
   const [sessionKs, setSessionKs] = useState(() => rHex(16));
   const [sessionStart, setSessionStart] = useState(Date.now());
-  const [lastFetch, setLastFetch] = useState(0);
+  const [connected, setConnected] = useState(false);
   const endRef = useRef(null);
   const bcRef = useRef(null);
+  // хранит id всех уже известных сообщений чтобы не дублировать
+  const knownIds = useRef(new Set());
 
   const addCLog = useCallback((type, tag, msg) => {
     const cls = {ok:'adm-bok',err:'adm-berr',warn:'adm-bwarn',info:'adm-binfo'}[type]||'adm-binfo';
@@ -663,7 +691,6 @@ function ChatPage({ addLog, showToast }) {
     addLog(type, tag, msg);
   }, [addLog]);
 
-  // Renew session key when TTL expires
   const renewSession = useCallback(() => {
     const newKs = rHex(16);
     setSessionKs(newKs);
@@ -684,70 +711,90 @@ function ChatPage({ addLog, showToast }) {
     return () => clearInterval(t);
   }, [sessionStart, renewSession]);
 
-  // Load local messages on mount
+  // ── Инициализация: локальный кеш + Firebase SSE ──────────────────────────
   useEffect(() => {
+    // 1. Загрузить локальный кеш сразу
     const local = loadLocalMsgs();
-    if (local.length) setMessages(local);
+    if (local.length) {
+      setMessages(local);
+      local.forEach(m => knownIds.current.add(m.id));
+    }
     addCLog('ok','[KDC]',`Сессионный ключ: ${sessionKs.substr(0,8)}… TTL=${SESSION_TTL}s`);
-    addCLog('info','[NS]','NS-KDC протокол активен — сообщения зашифрованы');
-  }, []);
 
-  // BroadcastChannel (same browser, different tabs)
-  useEffect(() => {
+    // 2. BroadcastChannel — одинаковый браузер, разные вкладки
     try {
       bcRef.current = new BroadcastChannel('qmg_chat_ns');
       bcRef.current.onmessage = (e) => {
-        if (e.data?.type === 'new_msg' && e.data.msg.from !== 'admin') {
+        if (e.data?.type === 'new_msg') {
+          const m = e.data.msg;
+          if (m.from === 'admin') return;
+          if (knownIds.current.has(m.id)) return;
+          knownIds.current.add(m.id);
           setMessages(prev => {
-            if (prev.find(m => m.id === e.data.msg.id)) return prev;
-            const updated = [...prev, e.data.msg];
+            const updated = [...prev, m].sort((a,b)=>a.timestamp-b.timestamp);
             saveLocalMsgs(updated);
             return updated;
           });
-          addCLog('ok','[ЧАТ]',`operator → admin: зашифрованное сообщение получено`);
-          showToast('💬 Новое зашифрованное сообщение от оператора!','tok');
+          addCLog('ok','[ЧАТ]','operator → admin: сообщение получено (та же вкладка)');
+          showToast('💬 Новое сообщение от оператора!','tok');
         }
       };
     } catch {}
-    return () => { try { bcRef.current?.close(); } catch {} };
-  }, [addCLog, showToast]);
 
-  // Firebase polling (cross-device)
-  useEffect(() => {
-    const poll = async () => {
-      const remote = await fbFetch(lastFetch);
-      if (remote.length) {
-        setLastFetch(Date.now());
-        setMessages(prev => {
-          const ids = new Set(prev.map(m => m.id));
-          const newMsgs = remote.filter(m => !ids.has(m.id) && m.from !== 'admin');
-          if (!newMsgs.length) return prev;
-          const updated = [...prev, ...newMsgs].sort((a,b)=>a.timestamp-b.timestamp);
-          saveLocalMsgs(updated);
-          newMsgs.forEach(() => {
-            addCLog('ok','[FIREBASE]','Новое сообщение от оператора (cross-device)');
-            showToast('📡 Новое сообщение от оператора!','tok');
+    // 3. Firebase SSE — разные устройства, мгновенно
+    if (FB_ENABLED) {
+      addCLog('info','[FIREBASE]','Подключение к Firebase Realtime DB…');
+      const unsub = fbSubscribe(
+        (allMsgs) => {
+          // put-событие — полный снимок базы
+          setConnected(true);
+          const incoming = allMsgs.filter(m => {
+            if (m.from === 'admin') return false; // свои не дублируем
+            if (knownIds.current.has(m.id)) return false;
+            return true;
           });
-          return updated;
-        });
-      }
-    };
-    const t = setInterval(poll, 3000);
-    return () => clearInterval(t);
-  }, [lastFetch, addCLog, showToast]);
+          if (!incoming.length) return;
+          incoming.forEach(m => knownIds.current.add(m.id));
+          setMessages(prev => {
+            const ids = new Set(prev.map(x=>x.id));
+            const fresh = incoming.filter(m=>!ids.has(m.id));
+            if (!fresh.length) return prev;
+            const updated = [...prev, ...fresh].sort((a,b)=>a.timestamp-b.timestamp);
+            saveLocalMsgs(updated);
+            fresh.forEach(() => {
+              addCLog('ok','[FIREBASE]','operator → admin: сообщение получено мгновенно');
+              showToast('💬 Новое сообщение от оператора!','tok');
+            });
+            return updated;
+          });
+        },
+        () => {
+          setConnected(false);
+          addCLog('warn','[FIREBASE]','Соединение потеряно, переподключение…');
+        }
+      );
+      return () => {
+        unsub();
+        try { bcRef.current?.close(); } catch {}
+      };
+    }
+
+    addCLog('info','[NS]','NS-KDC протокол активен (BroadcastChannel режим)');
+    return () => { try { bcRef.current?.close(); } catch {} };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => { endRef.current?.scrollIntoView({behavior:'smooth'}); }, [messages]);
 
   const sendMsg = () => {
     if (!input.trim()) return;
 
-    // Renew key if expired
     let ks = sessionKs;
     if ((Date.now() - sessionStart) / 1000 >= SESSION_TTL) {
       ks = rHex(16);
       setSessionKs(ks);
       setSessionStart(Date.now());
-      addCLog('warn','[KDC]',`Автообновление ключа перед отправкой: ${ks.substr(0,8)}…`);
+      addCLog('warn','[KDC]',`Автообновление ключа: ${ks.substr(0,8)}…`);
     }
 
     const ticket = generateNSTicket('admin','operator', ks);
@@ -761,24 +808,31 @@ function ChatPage({ addLog, showToast }) {
       time: ts(),
     };
 
-    const updated = [...messages, msg];
-    setMessages(updated);
-    saveLocalMsgs(updated);
+    // Показываем сразу локально
+    knownIds.current.add(msg.id);
+    setMessages(prev => {
+      const updated = [...prev, msg];
+      saveLocalMsgs(updated);
+      return updated;
+    });
     setInput('');
 
-    // Broadcast (same browser)
+    // Broadcast одновременно открытым вкладкам
     try { bcRef.current?.postMessage({type:'new_msg',msg}); } catch {}
-    // Firebase (cross-device)
+
+    // Firebase — доставка на другое устройство
     fbPush(msg).then(ok => {
-      if(ok) addCLog('ok','[FIREBASE]',`Сообщение опубликовано в Firebase`);
+      if (ok) addCLog('ok','[FIREBASE]','Сообщение отправлено — оператор получит мгновенно');
+      else addCLog('warn','[FIREBASE]','Firebase недоступен — только BroadcastChannel');
     });
 
-    addCLog('ok','[NS-KDC]',`admin→operator: зашифровано Ks=${ks.substr(0,8)}… Na=0x${ticket.Na} Nb=0x${ticket.Nb}`);
+    addCLog('ok','[NS-KDC]',`admin→operator: Ks=${ks.substr(0,8)}… Na=0x${ticket.Na} Nb=0x${ticket.Nb}`);
   };
 
   const ttlPct = (ttl / SESSION_TTL) * 100;
   const ttlColor = ttl > 60 ? 'var(--green)' : ttl > 20 ? 'var(--amber)' : 'var(--red)';
   const ttlCls = ttl > 60 ? 'ns-ttl-ok' : ttl > 20 ? 'ns-ttl-warn' : 'ns-ttl-dead';
+  const connLabel = !FB_ENABLED ? 'BroadcastChannel' : connected ? '🟢 Firebase RT' : '🟡 Переподключение…';
 
   return (
     <div className="adm-pg">
@@ -807,7 +861,10 @@ function ChatPage({ addLog, showToast }) {
       <div className="adm-card adm-mb">
         <div className="adm-card-t">
           <span>🔑 KDC Сессионный ключ</span>
-          <span className={`adm-bdg ${ttlCls}`}>TTL: {ttl}s</span>
+          <span style={{display:'flex',gap:8,alignItems:'center'}}>
+            <span style={{fontSize:10,color:'var(--t2)'}}>{connLabel}</span>
+            <span className={`adm-bdg ${ttlCls}`}>TTL: {ttl}s</span>
+          </span>
         </div>
         <div style={{display:'flex',alignItems:'center',gap:10}}>
           <div style={{flex:1,height:4,background:'var(--border)',borderRadius:2,overflow:'hidden'}}>
